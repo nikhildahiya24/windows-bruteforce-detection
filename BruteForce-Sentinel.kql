@@ -1,0 +1,125 @@
+// =============================================================================================
+// Windows brute force / password spray / success-after-failure  (Microsoft Sentinel)
+// Table: SecurityEvent (Windows Security Events via AMA, "Common" or "All" event set)
+// Logic mirrors Detect-BruteForce.ps1 so offline and SIEM results agree.
+//
+// Scheduled analytics rule settings
+//   Query frequency : 10 minutes          Lookup period : 1 hour
+//   Alert threshold : results > 0         Event grouping: one alert per result row
+//   Incident grouping: ON, match by IP + Account entities, re-open closed incidents OFF,
+//                      group within 6 hours (a long attack produces one incident, not many)
+//   Entity mapping  : IP -> IpAddress ; Account -> TargetUser ; Host -> TargetHost
+//   Custom details  : DetectionType, Failures, DistinctUsers, FailureReasons, SuccessfulUsers
+//   Note: windows are fixed 10-minute bins, so an attack crossing a boundary yields one row per
+//         window; incident grouping folds them into one incident. IPv6 sources report External.
+//   Alert severity  : dynamic, from the Severity column (Alert details -> Severity -> Severity)
+//   MITRE ATT&CK    : Credential Access T1110.001 (guessing), T1110.003 (spraying);
+//                     Initial Access T1078 (valid accounts) when SuccessAfterFailure = true
+// =============================================================================================
+let lookback        = 1h;
+let window          = 10m;   // grouping bucket
+let failThreshold   = 10;    // failures for ONE user from ONE IP per window
+let sprayThreshold  = 10;    // DISTINCT users failing from ONE IP per window
+let successGrace    = 30m;   // how long after the last failure a 4624 still counts
+let runFrequency    = 10m;   // keep equal to the rule's query frequency
+// Replace with a watchlist: _GetWatchlist('PrivilegedAccounts') | project SearchKey
+let privilegedRegex = @"^(administrator|adm\..*|.*admin.*)$";
+let ignoreIps       = dynamic(["-", "", "127.0.0.1", "::1"]);
+let failures = SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 4625
+    | where IpAddress !in (ignoreIps)
+    | extend TargetUser = tolower(strcat(TargetDomainName, @"\", TargetUserName)),
+             SubStatus  = toupper(SubStatus)
+    | extend Window = bin(TimeGenerated, window);
+let successes = SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 4624
+    | where LogonType in (2, 3, 7, 8, 10, 11)        // interactive, network, unlock, cleartext, RDP, cached
+    | where IpAddress !in (ignoreIps)
+    | extend SuccessUser = tolower(strcat(TargetDomainName, @"\", TargetUserName))
+    | project SuccessTime = TimeGenerated, IpAddress, SuccessUser, SuccessLogonType = LogonType;
+// 1) Brute force: one IP hammering one account
+let bruteForce = failures
+    | summarize Failures = count(), FirstFail = min(TimeGenerated), LastFail = max(TimeGenerated),
+                Users = make_set(TargetUser, 100), TargetHosts = make_set(Computer, 20),
+                LogonTypes = make_set(LogonType)
+        by IpAddress, TargetUser, Window
+    | where Failures >= failThreshold
+    | extend DetectionType = "BruteForce", DistinctUsers = 1;
+// 2) Password spray: one IP trying many accounts
+let spray = failures
+    | summarize Failures = count(), FirstFail = min(TimeGenerated), LastFail = max(TimeGenerated),
+                DistinctUsers = dcount(TargetUser), Users = make_set(TargetUser, 100),
+                TargetHosts = make_set(Computer, 20), LogonTypes = make_set(LogonType)
+        by IpAddress, Window
+    | where DistinctUsers >= sprayThreshold
+    | extend DetectionType = "PasswordSpray", TargetUser = tostring(Users[0]);
+let candidates = union bruteForce, spray
+    | extend AlertKey = strcat(DetectionType, "|", IpAddress, "|", iff(DetectionType == "BruteForce", TargetUser, ""), "|", tostring(Window));
+// 3) Did any targeted account then log on successfully from the same IP?
+let successHits = candidates
+    | project AlertKey, IpAddress, Users, FirstFail, LastFail
+    | join kind=inner successes on IpAddress
+    | where SuccessTime between (FirstFail .. (LastFail + successGrace))
+    | where set_has_element(Users, SuccessUser)
+    | summarize SuccessfulUsers = make_set(SuccessUser), FirstSuccess = min(SuccessTime),
+                SuccessLogonTypes = make_set(SuccessLogonType) by AlertKey;
+// Failure-reason breakdown, e.g. {"0xC000006A":64}
+let reasons = failures
+    | join kind=inner (candidates | project AlertKey, IpAddress, DetectionType, TargetUser, Window)
+        on IpAddress, Window
+    | where DetectionType == "PasswordSpray" or TargetUser == TargetUser1
+    | summarize n = count() by AlertKey, SubStatus
+    | summarize FailureReasons = make_bag(bag_pack(SubStatus, n)) by AlertKey;
+candidates
+| join kind=leftouter successHits on AlertKey
+| join kind=leftouter reasons on AlertKey
+| extend SuccessAfterFailure = isnotempty(FirstSuccess),
+         SourceScope = iff(ipv4_is_private(IpAddress), "Internal", "External")
+| mv-apply u = Users to typeof(string) on (
+      summarize PrivilegedTargeted = make_set_if(u, tostring(split(u, @"\")[1]) matches regex privilegedRegex)
+  )
+| extend Severity = case(
+      SuccessAfterFailure,                                                   "High",
+      DetectionType == "BruteForce" and array_length(PrivilegedTargeted) > 0, "High",
+      SourceScope == "External" or DetectionType == "PasswordSpray",          "Medium",
+                                                                              "Low"),
+         DetectionType = iff(SuccessAfterFailure, strcat(DetectionType, "+SuccessAfterFailure"), DetectionType),
+         LockoutObserved = FailureReasons has "0XC0000234",
+         TargetHost = tostring(TargetHosts[0])
+| extend SeverityRank = case(Severity == "High", 0, Severity == "Medium", 1, 2)
+// Alert only on fresh activity so each 10-minute run does not re-raise old windows
+| where LastFail > ago(runFrequency) or FirstSuccess > ago(runFrequency)
+| project Severity, DetectionType, IpAddress, SourceScope, TargetUser, FirstFail, LastFail, Failures,
+          DistinctUsers, Users, PrivilegedTargeted, TargetHost, TargetHosts, LogonTypes, FailureReasons,
+          LockoutObserved, SuccessAfterFailure, SuccessfulUsers, FirstSuccess, SuccessLogonTypes
+| order by SeverityRank asc, FirstFail asc
+
+
+// =============================================================================================
+// Hunting / triage helpers (run ad hoc, not as the rule)
+// =============================================================================================
+
+// A. Failed-logon heat map by source IP and user, last 24 h
+// SecurityEvent
+// | where TimeGenerated > ago(24h) and EventID == 4625
+// | summarize Failures = count(), Users = dcount(TargetUserName), Reasons = make_set(SubStatus),
+//             First = min(TimeGenerated), Last = max(TimeGenerated) by IpAddress, Computer
+// | order by Failures desc
+
+// B. Everything an IP did, successes and failures, in time order (use during triage)
+// let ip = "198.51.100.23";
+// SecurityEvent
+// | where TimeGenerated > ago(7d) and EventID in (4624, 4625, 4634, 4647, 4648, 4672, 4740)
+// | where IpAddress == ip or Computer in (SecurityEvent | where IpAddress == ip | distinct Computer)
+// | project TimeGenerated, EventID, Computer, TargetUserName, LogonType, IpAddress, SubStatus, TargetLogonId
+// | order by TimeGenerated asc
+
+// C. What a compromised account did after logon: privileges (4672), processes (4688), lockouts (4740)
+// let user = "adm.jsmith";
+// SecurityEvent
+// | where TimeGenerated > ago(7d) and (TargetUserName =~ user or SubjectUserName =~ user)
+// | where EventID in (4624, 4672, 4688, 4720, 4728, 4732, 4740, 1102)
+// | project TimeGenerated, EventID, Activity, Computer, IpAddress, NewProcessName, CommandLine
+// | order by TimeGenerated asc
